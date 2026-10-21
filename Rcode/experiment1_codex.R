@@ -1,11 +1,17 @@
 ##### Birth-Death Coalescent
 ##### Author: JP +Codex
 
-make_coal_model <- function(n, N, mu, eta) {
+# Hazard of the next merger, conditional on n distinct lineages and
+# initial_population individuals at the start of this waiting interval.
+# Initially initial_population = N - 1 (sampling just before hitting N).
+make_coal_model <- function(n, N, mu, eta, initial_population = N - 1L) {
   stopifnot(
     length(N) == 1L, is.finite(N), N >= 3, N == floor(N),
     length(n) == 1L, is.finite(n),
     n >= 2, n <= N - 1, n == floor(n),
+    length(initial_population) == 1L, is.finite(initial_population),
+    initial_population == floor(initial_population),
+    initial_population >= n, initial_population <= N - 1,
     length(mu) == 1L, is.finite(mu), mu > 0,
     length(eta) == 1L, is.finite(eta), eta > 0
   )
@@ -57,8 +63,11 @@ make_coal_model <- function(n, N, mu, eta) {
   rates <- eig$values
   stopifnot(all(rates < 0))
 
-  # S(t) = beta exp(K_n t) 1; f(t) = beta exp(K_n t) c.
-  initial <- d[size] * eig$vectors[size, ]
+  # beta is concentrated at initial_population, which need not be m
+  # after a previous merger. S(t) = beta exp(K_n t) 1 and
+  # f(t) = beta exp(K_n t) c, so lambda(t) = f(t) / S(t).
+  initial_index <- initial_population - n + 1L
+  initial <- d[initial_index] * eig$vectors[initial_index, ]
   survival_coefficients <- initial *
     drop(crossprod(eig$vectors, 1 / d))
   density_coefficients <- initial *
@@ -102,7 +111,12 @@ make_coal_model <- function(n, N, mu, eta) {
     K = K,
     states = states,
     absorption_rates = c_rate,
-    n = n
+    n = n,
+    N = N,
+    mu = mu,
+    eta = eta,
+    B = b,
+    initial_population = initial_population
   )
 }
 
@@ -172,6 +186,71 @@ simulate_two <- function(model, nsim = 1000L) {
   }, numeric(1))
 }
 
+# Simulate all n-1 mergers by following the joint population/lineage CTMC.
+# This samples the same waiting laws as the conditional PH hazards above,
+# while retaining the population size needed for each subsequent interval.
+# No independent restart of the population process occurs at a merger.
+simulate_coalescent <- function(model, nsim = 1000L) {
+  stopifnot(
+    length(nsim) == 1L, is.finite(nsim),
+    nsim >= 0, nsim == floor(nsim)
+  )
+
+  n <- model$n
+  m <- model$N - 1L
+  states <- seq.int(2L, m)
+  down <- up <- numeric(m)
+  down[states] <- states * model$mu * model$B[states]
+  if (m > 2L) {
+    k <- seq.int(2L, m - 1L)
+    up[k] <- k * model$eta / model$B[k + 1L]
+  }
+
+  labels <- paste0(seq.int(n, 2L), "_to_", seq.int(n - 1L, 1L))
+  times <- matrix(0, nrow = nsim, ncol = n - 1L,
+                  dimnames = list(NULL, labels))
+  population_sizes <- matrix(NA_integer_, nrow = nsim, ncol = n - 1L,
+                             dimnames = list(NULL, labels))
+  for (replicate in seq_len(nsim)) {
+    population <- model$initial_population
+    lineages <- n
+    elapsed <- 0
+    while (lineages > 1L) {
+      total_rate <- up[population] + down[population]
+      elapsed <- elapsed + rexp(1L, rate = total_rate)
+      if (runif(1L) < up[population] / total_rate) {
+        population <- population + 1L
+      } else {
+        # A population merger coalesces a uniformly chosen pair.
+        p_coal <- lineages * (lineages - 1) /
+          (population * (population - 1))
+        population <- population - 1L
+        if (runif(1L) < p_coal) {
+          column <- n - lineages + 1L
+          times[replicate, column] <- elapsed
+          population_sizes[replicate, column] <- population
+          lineages <- lineages - 1L
+        }
+      }
+    }
+  }
+
+  waiting_times <- times
+  if (n > 2L) {
+    waiting_times[, 2:(n - 1L)] <-
+      times[, 2:(n - 1L), drop = FALSE] -
+      times[, 1:(n - 2L), drop = FALSE]
+  }
+  list(
+    # Absolute times backward from sampling, in increasing order.
+    times = times,
+    # Durations between consecutive mergers (first measured from sampling).
+    waiting_times = waiting_times,
+    # Population sizes immediately after each merger.
+    population_sizes = population_sizes
+  )
+}
+
 set.seed(123)
 coal_times <- simulate_two(model03, 1000)
 
@@ -179,5 +258,19 @@ hist(coal_times)
 abline(v=mean(coal_times),col="red")
 
 # Eventual coalescence has probability one:
-exp(-model03$total_hazard)
+#exp(-model03$total_hazard)
 
+
+# General sample: each row has n-1 ordered times backward from sampling.
+model4 <- make_coal_model(n = 4, N = 6, mu = 0.6, eta = 0.3)
+coal4 <- simulate_coalescent(model4, nsim = 1000)
+head(coal4$times)
+head(coal4$waiting_times)
+boxplot(coal4$times)
+# Conditional hazard after the first merger in the first replicate:
+# elapsed time below is measured since that merger, not since sampling.
+after_first <- make_coal_model(
+  n = model4$n - 1L, N = model4$N, mu = model4$mu, eta = model4$eta,
+  initial_population = coal4$population_sizes[1L, 1L]
+)
+after_first$lambda(c(0, 0.5, 1))
